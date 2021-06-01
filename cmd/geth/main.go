@@ -422,6 +422,52 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
 			utils.Fatalf("Failed to start mining: %v", err)
 		}
 	}
+
+	/*go func() {
+		sleepFor := 15 * time.Second
+		ctx := context.Background()
+		latestProcessedBlock := uint64(0)
+		for {
+			fromTime := float64(time.Now().UnixNano()) / 1e9
+			latestBlock, err := ethClient.BlockByNumber(ctx, nil)
+			if err != nil {
+				log.Error("Can't get latest block", "error", err)
+				time.Sleep(sleepFor)
+				continue
+			}
+			log.Info("Found latest block", "number", latestBlock.NumberU64(), "ms", float64(time.Now().UnixNano())/1e9-fromTime)
+			if latestProcessedBlock >= latestBlock.NumberU64() {
+				log.Info("There is no new blocks to process")
+				time.Sleep(sleepFor)
+				continue
+			}
+			log.Info("New block for processing", "number", latestProcessedBlock+1)
+			fromTime = float64(time.Now().UnixNano()) / 1e9
+			newBlock, err := ethClient.BlockByNumber(ctx, big.NewInt(int64(latestProcessedBlock)+1))
+			if err != nil {
+				log.Error("Can't get new block", "error", err)
+				time.Sleep(sleepFor)
+				continue
+			}
+			receipts := make(map[common.Hash]*types.Receipt)
+			failed := false
+			for _, tx := range newBlock.Transactions() {
+				receipt, err := ethClient.TransactionReceipt(ctx, tx.Hash())
+				if err != nil {
+					log.Error("Can't get by hash ", "hash", tx.Hash().Hex(), "error", err)
+					failed = true
+					break
+				}
+				receipts[tx.Hash()] = receipt
+			}
+			if failed {
+				time.Sleep(sleepFor)
+				continue
+			}
+			log.Info("Found new block", "number", newBlock.NumberU64(), "ms", float64(time.Now().UnixNano())/1e9-fromTime)
+			latestProcessedBlock++
+		}
+	}()*/
 }
 
 // unlockAccounts unlocks any account specifically requested.
