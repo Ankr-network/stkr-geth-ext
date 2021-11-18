@@ -67,7 +67,6 @@ var (
 
 	testConfig = &Config{
 		Recommit: time.Second,
-		GasFloor: params.GenesisGasLimit,
 		GasCeil:  params.GenesisGasLimit,
 	}
 )
@@ -75,8 +74,10 @@ var (
 func init() {
 	testTxPoolConfig = core.DefaultTxPoolConfig
 	testTxPoolConfig.Journal = ""
-	ethashChainConfig = params.TestChainConfig
-	cliqueChainConfig = params.TestChainConfig
+	ethashChainConfig = new(params.ChainConfig)
+	*ethashChainConfig = *params.TestChainConfig
+	cliqueChainConfig = new(params.ChainConfig)
+	*cliqueChainConfig = *params.TestChainConfig
 	cliqueChainConfig.Clique = &params.CliqueConfig{
 		Period: 10,
 		Epoch:  30000,
@@ -84,19 +85,21 @@ func init() {
 
 	signer := types.LatestSigner(params.TestChainConfig)
 	tx1 := types.MustSignNewTx(testBankKey, signer, &types.AccessListTx{
-		ChainID: params.TestChainConfig.ChainID,
-		Nonce:   0,
-		To:      &testUserAddress,
-		Value:   big.NewInt(1000),
-		Gas:     params.TxGas,
+		ChainID:  params.TestChainConfig.ChainID,
+		Nonce:    0,
+		To:       &testUserAddress,
+		Value:    big.NewInt(1000),
+		Gas:      params.TxGas,
+		GasPrice: big.NewInt(params.InitialBaseFee),
 	})
 	pendingTxs = append(pendingTxs, tx1)
 
 	tx2 := types.MustSignNewTx(testBankKey, signer, &types.LegacyTx{
-		Nonce: 1,
-		To:    &testUserAddress,
-		Value: big.NewInt(1000),
-		Gas:   params.TxGas,
+		Nonce:    1,
+		To:       &testUserAddress,
+		Value:    big.NewInt(1000),
+		Gas:      params.TxGas,
+		GasPrice: big.NewInt(params.InitialBaseFee),
 	})
 	newTxs = append(newTxs, tx2)
 

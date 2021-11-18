@@ -22,10 +22,12 @@ import (
 	"math/big"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/prque"
+	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
@@ -110,6 +112,14 @@ var (
 	invalidTxMeter     = metrics.NewRegisteredMeter("txpool/invalid", nil)
 	underpricedTxMeter = metrics.NewRegisteredMeter("txpool/underpriced", nil)
 	overflowedTxMeter  = metrics.NewRegisteredMeter("txpool/overflowed", nil)
+	// throttleTxMeter counts how many transactions are rejected due to too-many-changes between
+	// txpool reorgs.
+	throttleTxMeter = metrics.NewRegisteredMeter("txpool/throttle", nil)
+	// reorgDurationTimer measures how long time a txpool reorg takes.
+	reorgDurationTimer = metrics.NewRegisteredTimer("txpool/reorgtime", nil)
+	// dropBetweenReorgHistogram counts how many drops we experience between two reorg runs. It is expected
+	// that this number is pretty low, since txpool reorgs happen very frequently.
+	dropBetweenReorgHistogram = metrics.NewRegisteredHistogram("txpool/dropbetweenreorg", nil, metrics.NewExpDecaySample(1028, 0.015))
 
 	pendingGauge = metrics.NewRegisteredGauge("txpool/pending", nil)
 	queuedGauge  = metrics.NewRegisteredGauge("txpool/queued", nil)
@@ -255,6 +265,9 @@ type TxPool struct {
 	reorgDoneCh     chan chan struct{}
 	reorgShutdownCh chan struct{}  // requests shutdown of scheduleReorgLoop
 	wg              sync.WaitGroup // tracks loop, scheduleReorgLoop
+	initDoneCh      chan struct{}  // is closed once the pool is initialized (for tests)
+
+	changesSinceReorg int // A counter for how many drops we've performed in-between reorg.
 }
 
 type txpoolResetRequest struct {
@@ -283,6 +296,7 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		queueTxEventCh:  make(chan *types.Transaction),
 		reorgDoneCh:     make(chan chan struct{}),
 		reorgShutdownCh: make(chan struct{}),
+		initDoneCh:      make(chan struct{}),
 		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
 	}
 	pool.locals = newAccountSet(pool.signer)
@@ -336,6 +350,8 @@ func (pool *TxPool) loop() {
 	defer evict.Stop()
 	defer journal.Stop()
 
+	// Notify tests that the init phase is done
+	close(pool.initDoneCh)
 	for {
 		select {
 		// Handle ChainHeadEvent
@@ -354,8 +370,8 @@ func (pool *TxPool) loop() {
 		case <-report.C:
 			pool.mu.RLock()
 			pending, queued := pool.stats()
-			stales := pool.priced.stales
 			pool.mu.RUnlock()
+			stales := int(atomic.LoadInt64(&pool.priced.stales))
 
 			if pending != prevPending || queued != prevQueued || stales != prevStales {
 				log.Debug("Transaction pool status report", "executable", pending, "queued", queued, "stales", stales)
@@ -433,7 +449,7 @@ func (pool *TxPool) SetGasPrice(price *big.Int) {
 	pool.gasPrice = price
 	// if the min miner fee increased, remove transactions below the new threshold
 	if price.Cmp(old) > 0 {
-		// pool.priced is sorted by FeeCap, so we have to iterate through pool.all instead
+		// pool.priced is sorted by GasFeeCap, so we have to iterate through pool.all instead
 		drop := pool.all.RemotesBelowTip(price)
 		for _, tx := range drop {
 			pool.removeTx(tx.Hash(), false)
@@ -493,18 +509,52 @@ func (pool *TxPool) Content() (map[common.Address]types.Transactions, map[common
 	return pending, queued
 }
 
+// ContentFrom retrieves the data content of the transaction pool, returning the
+// pending as well as queued transactions of this address, grouped by nonce.
+func (pool *TxPool) ContentFrom(addr common.Address) (types.Transactions, types.Transactions) {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	var pending types.Transactions
+	if list, ok := pool.pending[addr]; ok {
+		pending = list.Flatten()
+	}
+	var queued types.Transactions
+	if list, ok := pool.queue[addr]; ok {
+		queued = list.Flatten()
+	}
+	return pending, queued
+}
+
 // Pending retrieves all currently processable transactions, grouped by origin
 // account and sorted by nonce. The returned transaction set is a copy and can be
 // freely modified by calling code.
-func (pool *TxPool) Pending() (map[common.Address]types.Transactions, error) {
+//
+// The enforceTips parameter can be used to do an extra filtering on the pending
+// transactions and only return those whose **effective** tip is large enough in
+// the next pending execution environment.
+func (pool *TxPool) Pending(enforceTips bool) map[common.Address]types.Transactions {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
 	pending := make(map[common.Address]types.Transactions)
 	for addr, list := range pool.pending {
-		pending[addr] = list.Flatten()
+		txs := list.Flatten()
+
+		// If the miner requests tip enforcement, cap the lists now
+		if enforceTips && !pool.locals.contains(addr) {
+			for i, tx := range txs {
+				if tx.EffectiveGasTipIntCmp(pool.gasPrice, pool.priced.urgent.baseFee) < 0 {
+					txs = txs[:i]
+					break
+				}
+			}
+		}
+		if len(txs) > 0 {
+			pending[addr] = txs
+		}
 	}
-	return pending, nil
+	return pending
 }
 
 // Locals retrieves the accounts currently considered local by the pool.
@@ -556,14 +606,14 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		return ErrGasLimit
 	}
 	// Sanity check for extremely large numbers
-	if tx.FeeCap().BitLen() > 256 {
+	if tx.GasFeeCap().BitLen() > 256 {
 		return ErrFeeCapVeryHigh
 	}
-	if tx.Tip().BitLen() > 256 {
+	if tx.GasTipCap().BitLen() > 256 {
 		return ErrTipVeryHigh
 	}
-	// Ensure feeCap is less than or equal to tip.
-	if tx.FeeCapIntCmp(tx.Tip()) < 0 {
+	// Ensure gasFeeCap is greater than or equal to gasTipCap.
+	if tx.GasFeeCapIntCmp(tx.GasTipCap()) < 0 {
 		return ErrTipAboveFeeCap
 	}
 	// Make sure the transaction is signed properly.
@@ -572,7 +622,7 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		return ErrInvalidSender
 	}
 	// Drop non-local transactions under our own minimal accepted gas price or tip
-	if !local && tx.TipIntCmp(pool.gasPrice) < 0 {
+	if !local && tx.GasTipCapIntCmp(pool.gasPrice) < 0 {
 		return ErrUnderpriced
 	}
 	// Ensure the transaction adheres to nonce ordering
@@ -600,8 +650,8 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 // pending or queued one, it overwrites the previous transaction if its price is higher.
 //
 // If a newly added transaction is marked as local, its sending account will be
-// whitelisted, preventing any associated transaction from being dropped out of the pool
-// due to pricing constraints.
+// be added to the allowlist, preventing any associated transaction from being dropped
+// out of the pool due to pricing constraints.
 func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err error) {
 	// If the transaction is already known, discard it
 	hash := tx.Hash()
@@ -624,10 +674,19 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
 		// If the new transaction is underpriced, don't accept it
 		if !isLocal && pool.priced.Underpriced(tx) {
-			log.Trace("Discarding underpriced transaction", "hash", hash, "tip", tx.Tip(), "feeCap", tx.FeeCap())
+			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
 			underpricedTxMeter.Mark(1)
 			return false, ErrUnderpriced
 		}
+		// We're about to replace a transaction. The reorg does a more thorough
+		// analysis of what to remove and how, but it runs async. We don't want to
+		// do too many replacements between reorg-runs, so we cap the number of
+		// replacements to 25% of the slots
+		if pool.changesSinceReorg > int(pool.config.GlobalSlots/4) {
+			throttleTxMeter.Mark(1)
+			return false, ErrTxPoolOverflow
+		}
+
 		// New transaction is better than our worse ones, make room for it.
 		// If it's a local transaction, forcibly discard all available transactions.
 		// Otherwise if we can't make enough room for new one, abort the operation.
@@ -639,9 +698,11 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 			overflowedTxMeter.Mark(1)
 			return false, ErrTxPoolOverflow
 		}
+		// Bump the counter of rejections-since-reorg
+		pool.changesSinceReorg += len(drop)
 		// Kick out the underpriced remote transactions.
 		for _, tx := range drop {
-			log.Trace("Discarding freshly underpriced transaction", "hash", tx.Hash(), "tip", tx.Tip(), "feeCap", tx.FeeCap())
+			log.Trace("Discarding freshly underpriced transaction", "hash", tx.Hash(), "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
 			underpricedTxMeter.Mark(1)
 			pool.removeTx(tx.Hash(), false)
 		}
@@ -1079,6 +1140,9 @@ func (pool *TxPool) scheduleReorgLoop() {
 
 // runReorg runs reset and promoteExecutables on behalf of scheduleReorgLoop.
 func (pool *TxPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirtyAccounts *accountSet, events map[common.Address]*txSortedMap) {
+	defer func(t0 time.Time) {
+		reorgDurationTimer.Update(time.Since(t0))
+	}(time.Now())
 	defer close(done)
 
 	var promoteAddrs []common.Address
@@ -1114,19 +1178,24 @@ func (pool *TxPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirt
 	// because of another transaction (e.g. higher gas price).
 	if reset != nil {
 		pool.demoteUnexecutables()
-		if reset.newHead != nil {
-			pool.priced.SetBaseFee(reset.newHead.BaseFee)
+		if reset.newHead != nil && pool.chainconfig.IsLondon(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
+			pendingBaseFee := misc.CalcBaseFee(pool.chainconfig, reset.newHead)
+			pool.priced.SetBaseFee(pendingBaseFee)
 		}
+		// Update all accounts to the latest known pending nonce
+		nonces := make(map[common.Address]uint64, len(pool.pending))
+		for addr, list := range pool.pending {
+			highestPending := list.LastElement()
+			nonces[addr] = highestPending.Nonce() + 1
+		}
+		pool.pendingNonces.setAll(nonces)
 	}
 	// Ensure pool.queue and pool.pending sizes stay within the configured limits.
 	pool.truncatePending()
 	pool.truncateQueue()
 
-	// Update all accounts to the latest known pending nonce
-	for addr, list := range pool.pending {
-		highestPending := list.LastElement()
-		pool.pendingNonces.set(addr, highestPending.Nonce()+1)
-	}
+	dropBetweenReorgHistogram.Update(int64(pool.changesSinceReorg))
+	pool.changesSinceReorg = 0 // Reset change counter
 	pool.mu.Unlock()
 
 	// Notify subsystems for newly added transactions
@@ -1746,7 +1815,7 @@ func (t *txLookup) RemoteToLocals(locals *accountSet) int {
 func (t *txLookup) RemotesBelowTip(threshold *big.Int) types.Transactions {
 	found := make(types.Transactions, 0, 128)
 	t.Range(func(hash common.Hash, tx *types.Transaction, local bool) bool {
-		if tx.TipIntCmp(threshold) < 0 {
+		if tx.GasTipCapIntCmp(threshold) < 0 {
 			found = append(found, tx)
 		}
 		return true
