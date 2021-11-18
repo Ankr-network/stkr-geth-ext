@@ -42,7 +42,7 @@ jobs:
             <<: *global-variables
           command: |
             BINARY_NAME=$(ssh -o StrictHostKeyChecking=no -t $SSH_USERNAME@$SSH_IP "ls `echo $BINARY_DIR` | grep `echo $CIRCLE_SHA1` | tr -d '\n'")
-            BINARY_PATH=$BINARY_DIR$BINARY_NAME
+            BINARY_PATH=$BINARY_DIR/$BINARY_NAME
             echo "going to deploy $BINARY_PATH"
             SERVICE_PATH=/etc/systemd/system/$SERVICE_NAME.service
             ssh -o StrictHostKeyChecking=no -t $SSH_USERNAME@$SSH_IP "sed -Ei 's@ExecStart=[^[:space:]]+@ExecStart=`echo $BINARY_PATH`@g' `echo $SERVICE_PATH`"
