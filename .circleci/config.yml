@@ -24,7 +24,8 @@ jobs:
             make geth
             ls -lah ./build/bin
             echo uploading to $SSH_IP:$BINARY_DIR/geth-$VERSION-$CIRCLE_SHA1
-            scp -o StrictHostKeyChecking=no ./build/bin/geth $SSH_USERNAME@$SSH_IP:$BINARY_DIR/geth-$VERSION-$CIRCLE_SHA1
+            echo $SSH_PRIVATE_KEY > /tmp/id_rsa
+            scp -i /tmp/id_rsa -o StrictHostKeyChecking=no ./build/bin/geth $SSH_USERNAME@$SSH_IP:$BINARY_DIR/geth-$VERSION-$CIRCLE_SHA1
             cd ..
       - persist_to_workspace:
           root: '.'
