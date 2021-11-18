@@ -2,7 +2,7 @@ version: 2.1
 
 global-variables: &global-variables
   SERVICE_NAME: eth
-  BINARY_DIR: /mnt/chaindata/geth/bin/
+  BINARY_DIR: /mnt/chaindata/geth/bin
 
 jobs:
   build-and-upload:
@@ -23,8 +23,9 @@ jobs:
             VERSION=$(git log --decorate --pretty=oneline @ | egrep 'v[0-9\.]+[A-Za-z0-9\.-]*' -o | cut -d ":" -f2 | head -1 | sed -e 's/^ *//')
             make geth
             ls -lah ./build/bin
-            echo uploading to $SSH_IP:$BINARY_DIR/geth-$VERSION-$CIRCLE_SHA1
+            echo uploading to $BINARY_DIR/geth-$VERSION-$CIRCLE_SHA1
             echo $SSH_PRIVATE_KEY > /tmp/id_rsa
+            chmod 400 /tmp/id_rsa
             scp -i /tmp/id_rsa -o StrictHostKeyChecking=no ./build/bin/geth $SSH_USERNAME@$SSH_IP:$BINARY_DIR/geth-$VERSION-$CIRCLE_SHA1
             cd ..
       - persist_to_workspace:
