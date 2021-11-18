@@ -18,6 +18,9 @@ package core
 
 import (
 	"fmt"
+	"github.com/ethereum/go-ethereum/eth/tracers"
+	"github.com/ethereum/go-ethereum/log"
+	ioutil "io/ioutil"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -71,20 +74,49 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		misc.ApplyDAOHardFork(statedb)
 	}
 	blockContext := NewEVMBlockContext(header, p.bc, nil)
-	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, p.config, cfg)
+
 	// Iterate over and process the individual transactions
+
+
 	for i, tx := range block.Transactions() {
+		if tracer, err := tracers.New("callTracer", &tracers.Context{}); err == nil {
+			cfg.Tracer = tracer
+			cfg.Debug = true
+			cfg.NoBaseFee = true
+		} else {
+			panic("new tracer fucked")
+		}
+		vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, p.config, cfg)
 		msg, err := tx.AsMessage(types.MakeSigner(p.config, header.Number), header.BaseFee)
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
 		statedb.Prepare(tx.Hash(), i)
+		log.Info("PATCH: applying transaction", "hash", tx.Hash().String())
 		receipt, err := applyTransaction(msg, p.config, p.bc, nil, gp, statedb, blockNumber, blockHash, tx, usedGas, vmenv)
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
 		receipts = append(receipts, receipt)
 		allLogs = append(allLogs, receipt.Logs...)
+		tracer := vmenv.Config.Tracer
+
+		// Depending on the tracer type, format and return the output.
+		switch tracer := tracer.(type) {
+
+		case *tracers.Tracer:
+			log.Info("PATCH: getting tracing results")
+			traceResult, err := tracer.GetResult()
+			log.Info("PATCH: tracing results are fetched")
+			if err != nil {
+				log.Info("PATCH: error while getting results", "err", err)
+				panic(fmt.Sprintf("PATCH: failed to get tracing resutls: %s", err))
+			}
+			ioutil.WriteFile("traces.log", traceResult, 0644)
+
+		default:
+			panic(fmt.Sprintf("bad tracer type %T", tracer))
+		}
 	}
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles())

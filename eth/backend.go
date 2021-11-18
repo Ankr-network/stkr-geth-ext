@@ -20,6 +20,7 @@ package eth
 import (
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"math/big"
 	"runtime"
 	"sync"
@@ -172,9 +173,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			rawdb.WriteDatabaseVersion(chainDb, core.BlockChainVersion)
 		}
 	}
+	// Constuct the JavaScript tracer to execute with
+	var tracer *tracers.Tracer
+	if tracer, err = tracers.New("callTracer", &tracers.Context{}); err != nil {
+		return nil, err
+	}
 	var (
 		vmConfig = vm.Config{
 			EnablePreimageRecording: config.EnablePreimageRecording,
+			Debug: true, Tracer: tracer, NoBaseFee: true,
 		}
 		cacheConfig = &core.CacheConfig{
 			TrieCleanLimit:      config.TrieCleanCache,
